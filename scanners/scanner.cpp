@@ -3,37 +3,40 @@
 #include <sstream>
 #include <fstream>
 
-#include "../utils/util.h"
+#include "../utils/format_util.h"
 #include "../utils/path_converter.h"
 #include "../utils/workingset_enum.h"
 #include "../utils/modules_enum.h"
+#include "../utils/process_privilege.h"
+#include "../utils/process_util.h"
 
-#include "hollowing_scanner.h"
-#include "hook_scanner.h"
-#include "mempage_scanner.h"
+#include "headers_scanner.h"
+#include "code_scanner.h"
+#include "iat_scanner.h"
+#include "workingset_scanner.h"
 #include "mapping_scanner.h"
+#include "hook_targets_resolver.h"
 
 #include <string>
 #include <locale>
 #include <codecvt>
 
-#include <Psapi.h>
-#pragma comment(lib,"psapi.lib")
+using namespace pesieve;
+using namespace pesieve::util;
 
-t_scan_status ProcessScanner::scanForHollows(ModuleData& modData, RemoteModuleData &remoteModData, ProcessScanReport& process_report)
+t_scan_status pesieve::ProcessScanner::scanForHollows(HANDLE processHandle, ModuleData& modData, RemoteModuleData &remoteModData, ProcessScanReport& process_report)
 {
 	BOOL isWow64 = FALSE;
 #ifdef _WIN64
-	IsWow64Process(processHandle, &isWow64);
+	is_process_wow64(processHandle, &isWow64);
 #endif
-	HollowingScanner hollows(processHandle, modData, remoteModData);
+	HeadersScanner hollows(processHandle, modData, remoteModData);
 	HeadersScanReport *scan_report = hollows.scanRemote();
-	if (scan_report == nullptr) {
-		process_report.appendReport(new MalformedHeaderReport(processHandle, modData.moduleHandle, modData.original_size));
+	if (!scan_report) {
+		process_report.appendReport(new UnreachableModuleReport(processHandle, modData.moduleHandle, modData.original_size, modData.szModName));
 		return SCAN_ERROR;
 	}
-	t_scan_status is_hollowed = ModuleScanReport::get_scan_status(scan_report);
-
+	
 	if (scan_report->archMismatch && isWow64) {
 #ifdef _DEBUG
 		std::cout << "Arch mismatch, reloading..." << std::endl;
@@ -42,29 +45,116 @@ t_scan_status ProcessScanner::scanForHollows(ModuleData& modData, RemoteModuleDa
 			delete scan_report; // delete previous report
 			scan_report = hollows.scanRemote();
 		}
-		is_hollowed = ModuleScanReport::get_scan_status(scan_report);
+	}
+	scan_report->moduleFile = modData.szModName;
+
+	t_scan_status is_suspicious = ModuleScanReport::get_scan_status(scan_report);
+	if (is_suspicious && !scan_report->isHdrReplaced()) {
+		is_suspicious = SCAN_NOT_SUSPICIOUS;
 	}
 	process_report.appendReport(scan_report);
-	return is_hollowed;
+	return is_suspicious;
 }
 
-t_scan_status ProcessScanner::scanForHooks(ModuleData& modData, RemoteModuleData &remoteModData, ProcessScanReport& process_report)
+t_scan_status pesieve::ProcessScanner::scanForIATHooks(HANDLE processHandle, ModuleData& modData, RemoteModuleData &remoteModData, ProcessScanReport& process_report, bool filter)
 {
-	HookScanner hooks(processHandle, modData, remoteModData);
-
-	CodeScanReport *scan_report = hooks.scanRemote();
-	t_scan_status is_hooked = ModuleScanReport::get_scan_status(scan_report);
-	process_report.appendReport(scan_report);
-	
-	if (is_hooked != SCAN_SUSPICIOUS) {
-		return is_hooked;
+	const peconv::ExportsMapper *expMap = process_report.exportsMap;
+	if (!expMap) {
+		return SCAN_ERROR;
 	}
+
+	IATScanner scanner(processHandle, modData, remoteModData, *expMap, process_report.modulesInfo, filter);
+
+	IATScanReport *scan_report = scanner.scanRemote();
+	if (!scan_report) {
+		return SCAN_ERROR;
+	}
+	t_scan_status scan_res = ModuleScanReport::get_scan_status(scan_report);
+	scan_report->moduleFile = modData.szModName;
+	process_report.appendReport(scan_report);
+	return scan_res;
+}
+
+t_scan_status pesieve::ProcessScanner::scanForHooks(HANDLE processHandle, ModuleData& modData, RemoteModuleData &remoteModData, ProcessScanReport& process_report, bool scan_data)
+{
+	CodeScanner hooks(processHandle, modData, remoteModData);
+	hooks.scanData(scan_data);
+	CodeScanReport *scan_report = hooks.scanRemote();
+	if (!scan_report) return SCAN_ERROR;
+
+	t_scan_status is_hooked = ModuleScanReport::get_scan_status(scan_report);
+
+	scan_report->moduleFile = modData.szModName;
+	process_report.appendReport(scan_report);
 	return is_hooked;
 }
 
-ProcessScanReport* ProcessScanner::scanRemote()
+bool pesieve::ProcessScanner::resolveHooksTargets(ProcessScanReport& process_report)
 {
-	ProcessScanReport *pReport = new ProcessScanReport(this->args.pid);
+	HookTargetResolver hookResolver(process_report, this->processHandle);
+	const std::set<ModuleScanReport*> &code_reports = process_report.reportsByType[ProcessScanReport::REPORT_CODE_SCAN];
+	size_t resolved_count = hookResolver.resolveAllHooks(code_reports);
+	return (resolved_count > 0);
+}
+
+inline bool set_non_suspicious(const std::set<ModuleScanReport*> &scan_reports, bool dnet_modules_only)
+{
+	bool is_set = false;
+	std::set<ModuleScanReport*>::iterator itr;
+	for (itr = scan_reports.begin(); itr != scan_reports.end(); ++itr) {
+		ModuleScanReport* report = *itr;
+		if (!report) {
+			//this should never happen
+			continue;
+		}
+		if (dnet_modules_only && !report->isDotNetModule) {
+			continue;
+		}
+		if (report->status == SCAN_SUSPICIOUS) {
+			report->status = SCAN_NOT_SUSPICIOUS;
+			is_set = true;
+		}
+	}
+	return is_set;
+}
+
+bool pesieve::ProcessScanner::filterDotNetReport(ProcessScanReport& process_report)
+{
+	if (!process_report.isManaged || this->args.dotnet_policy == pesieve::PE_DNET_NONE) {
+		return false; // no filtering needed
+	}
+	bool is_set = false;
+	if (this->args.dotnet_policy == pesieve::PE_DNET_SKIP_MAPPING
+		|| this->args.dotnet_policy == pesieve::PE_DNET_SKIP_ALL)
+	{
+		// set hook modules as not suspicious
+		const std::set<ModuleScanReport*> &reports = process_report.reportsByType[ProcessScanReport::REPORT_MAPPING_SCAN];
+		is_set = set_non_suspicious(reports, true);
+	}
+	if (this->args.dotnet_policy == pesieve::PE_DNET_SKIP_HOOKS
+		|| this->args.dotnet_policy == pesieve::PE_DNET_SKIP_ALL)
+	{
+		// set hook modules as not suspicious
+		const std::set<ModuleScanReport*> &reports = process_report.reportsByType[ProcessScanReport::REPORT_CODE_SCAN];
+		is_set = set_non_suspicious(reports, false);
+	}
+	if (this->args.dotnet_policy == pesieve::PE_DNET_SKIP_SHC
+		|| this->args.dotnet_policy == pesieve::PE_DNET_SKIP_ALL)
+	{
+		// set shellcodes as not suspicious
+		const std::set<ModuleScanReport*> &reports = process_report.reportsByType[ProcessScanReport::REPORT_MEMPAGE_SCAN];
+		is_set = set_non_suspicious(reports, false);
+	}
+	return is_set;
+}
+
+ProcessScanReport* pesieve::ProcessScanner::scanRemote()
+{
+	this->isDEP = is_DEP_enabled(this->processHandle);
+
+	const bool is_64bit = pesieve::util::is_process_64bit(this->processHandle);
+
+	ProcessScanReport *pReport = new ProcessScanReport(this->args.pid, is_64bit);
 
 	char image_buf[MAX_PATH] = { 0 };
 	GetProcessImageFileNameA(this->processHandle, image_buf, MAX_PATH);
@@ -73,95 +163,90 @@ ProcessScanReport* ProcessScanner::scanRemote()
 	std::stringstream errorsStr;
 
 	// scan modules
-	bool modulesScanned = true;
+	size_t modulesScanned = 0;
+	size_t iatsScanned = 0;
 	try {
-		size_t scanned = scanModules(*pReport);
-		if (scanned == 0) {
-			modulesScanned = false;
-			errorsStr << "No modules found!";
+		modulesScanned = scanModules(*pReport);
+		if (args.iat) {
+			iatsScanned = scanModulesIATs(*pReport);
 		}
 	} catch (std::exception &e) {
-		modulesScanned = false;
+		modulesScanned = 0;
+		iatsScanned = 0;
 		errorsStr << e.what();
 	}
 
 	// scan working set
-	bool workingsetScanned = true;
+	size_t regionsScanned = 0;
 	try {
 		//dont't scan your own working set
-		if (GetProcessId(this->processHandle) != GetCurrentProcessId()) {
-			scanWorkingSet(*pReport);
+		if (peconv::get_process_id(this->processHandle) != GetCurrentProcessId()) {
+			regionsScanned = scanWorkingSet(*pReport);
 		}
 	} catch (std::exception &e) {
-		workingsetScanned = false;
+		regionsScanned = 0;
 		errorsStr << e.what();
 	}
 
-	// throw error only if both scans has failed:
-	if (!modulesScanned && !modulesScanned) {
+	// throw error only if none of the scans was successful
+	if (!modulesScanned && !iatsScanned && !regionsScanned) {
 		throw std::runtime_error(errorsStr.str());
 	}
+	//post-process hooks
+	resolveHooksTargets(*pReport);
+
+	//post-process .NET modules
+	filterDotNetReport(*pReport);
 	return pReport;
 }
 
-size_t ProcessScanner::scanWorkingSet(ProcessScanReport &pReport) //throws exceptions
+size_t pesieve::ProcessScanner::scanWorkingSet(ProcessScanReport &pReport) //throws exceptions
 {
-	PSAPI_WORKING_SET_INFORMATION wsi_1 = { 0 };
-	BOOL result = QueryWorkingSet(this->processHandle, (LPVOID)&wsi_1, sizeof(PSAPI_WORKING_SET_INFORMATION));
-	if (result == FALSE && GetLastError() != ERROR_BAD_LENGTH) {
-		throw std::runtime_error("Could not scan the working set in the process. ");
+	if (!util::count_workingset_entries(this->processHandle)) {
+		throw std::runtime_error("Could not query the working set. ");
 		return 0;
 	}
-#ifdef _DEBUG
-	std::cout << "Number of entries: " << std::dec << wsi_1.NumberOfEntries << std::endl;
-#endif
-
-#ifdef _DEBUG
 	DWORD start_tick = GetTickCount();
-#endif
 	std::set<ULONGLONG> region_bases;
-	size_t pages_count = enum_workingset(processHandle, region_bases);
+	size_t pages_count = util::enum_workingset(processHandle, region_bases);
 	if (!args.quiet) {
 		std::cout << "Scanning workingset: " << std::dec << pages_count << " memory regions." << std::endl;
 	}
 	size_t counter = 0;
 	//now scan all the nodes:
 	std::set<ULONGLONG>::iterator set_itr;
-	for (set_itr = region_bases.begin(); set_itr != region_bases.end(); set_itr++) {
-		ULONGLONG region_base = *set_itr;
+	for (set_itr = region_bases.begin(); set_itr != region_bases.end(); ++set_itr, ++counter) {
+		const ULONGLONG region_base = *set_itr;
 
 		MemPageData memPage(this->processHandle, region_base);
-		//if it was already scanned, it means the module was on the list of loaded modules
+
 		memPage.is_listed_module = pReport.hasModule(region_base);
+		memPage.is_dep_enabled = this->isDEP;
 
-		MemPageScanner memPageScanner(this->processHandle, memPage, this->args.shellcode);
-		MemPageScanReport *my_report = memPageScanner.scanRemote();
-
-		counter++;
-		if (my_report == nullptr) continue;
-
+		WorkingSetScanner memPageScanner(this->processHandle, memPage, this->args, pReport);
+		WorkingSetScanReport *my_report = memPageScanner.scanRemote();
+		if (!my_report) {
+			continue;
+		}
 		my_report->is_listed_module = pReport.hasModule((ULONGLONG) my_report->module);
 		// this is a code section inside a PE file that was already detected
-		if (!my_report->has_pe && pReport.hasModuleContaining((ULONGLONG)my_report->module)) {
+		if (!my_report->has_pe 
+			&& (pReport.hasModuleContaining((ULONGLONG)my_report->module, my_report->moduleSize))
+			)
+		{
 			my_report->status = SCAN_NOT_SUSPICIOUS;
 		}
 
 		pReport.appendReport(my_report);
-		/*if (ModuleScanReport::get_scan_status(my_report) == SCAN_SUSPICIOUS) {
-			if (my_report->is_manually_loaded) {
-				pReport.summary.implanted++;
-			}
-		}*/
 	}
-#ifdef _DEBUG
-	DWORD total_time = GetTickCount() - start_tick;
-	std::cout << "Workingset scan time: " << std::dec << total_time << std::endl;
-#endif
-
+	if (!args.quiet) {
+		DWORD total_time = GetTickCount() - start_tick;
+		std::cout << "[*] Workingset scanned in " << std::dec << total_time << " ms" << std::endl;
+	}
 	return counter;
 }
 
-ModuleScanReport* ProcessScanner::scanForMappingMismatch(ModuleData& modData, ProcessScanReport& process_report)
+ModuleScanReport* pesieve::ProcessScanner::scanForMappingMismatch(ModuleData& modData, ProcessScanReport& process_report)
 {
 	MappingScanner mappingScanner(processHandle, modData);
 
@@ -171,14 +256,14 @@ ModuleScanReport* ProcessScanner::scanForMappingMismatch(ModuleData& modData, Pr
 	return scan_report;
 }
 
-size_t ProcessScanner::scanModules(ProcessScanReport &pReport)  //throws exceptions
+size_t pesieve::ProcessScanner::scanModules(ProcessScanReport &pReport)  //throws exceptions
 {
 	HMODULE hMods[1024];
 	const size_t modules_count = enum_modules(this->processHandle, hMods, sizeof(hMods), args.modules_filter);
 	if (modules_count == 0) {
 		return 0;
 	}
-	if (args.imp_rec) {
+	if (args.imprec_mode != PE_IMPREC_NONE || args.iat != pesieve::PE_IATS_NONE) {
 		pReport.exportsMap = new peconv::ExportsMapper();
 	}
 
@@ -188,34 +273,50 @@ size_t ProcessScanner::scanModules(ProcessScanReport &pReport)  //throws excepti
 
 		//load module from file:
 		ModuleData modData(processHandle, hMods[counter]);
-
 		ModuleScanReport *mappingScanReport = this->scanForMappingMismatch(modData, pReport);
 
+		//load the original file to make the comparisons:
 		if (!modData.loadOriginal()) {
-			std::cout << "[!][" << args.pid <<  "] Suspicious: could not read the module file!" << std::endl;
+			if (!args.quiet) {
+				std::cout << "[!][" << args.pid << "] Suspicious: could not read the module file!" << std::endl;
+			}
 			//make a report that finding original module was not possible
-			pReport.appendReport(new UnreachableModuleReport(processHandle, hMods[counter], 0));
+			pReport.appendReport(new UnreachableModuleReport(processHandle, hMods[counter], 0, modData.szModName));
+			continue;
+		}
+
+		// Don't scan modules that are in the ignore list
+		std::string plainName = peconv::get_file_name(modData.szModName);
+		if (is_in_list(plainName.c_str(), this->ignoredModules)) {
+			// ...but add such modules to the exports lookup:
+			if (pReport.exportsMap && modData.loadOriginal()) {
+				pReport.exportsMap->add_to_lookup(modData.szModName, (HMODULE)modData.original_module, (ULONGLONG)modData.moduleHandle);
+			}
+			if (!args.quiet) {
+				std::cout << "[*] Skipping ignored: " << std::hex << (ULONGLONG)modData.moduleHandle << " : " << modData.szModName << std::endl;
+			}
+			pReport.appendReport(new SkippedModuleReport(processHandle, modData.moduleHandle, modData.original_size, modData.szModName));
 			continue;
 		}
 		if (!args.quiet) {
 			std::cout << "[*] Scanning: " << modData.szModName << std::endl;
 		}
-
 		if (modData.isDotNet()) {
+			pReport.isManaged = true;
 #ifdef _DEBUG
 			std::cout << "[*] Skipping a .NET module: " << modData.szModName << std::endl;
 #endif
-			pReport.appendReport(new SkippedModuleReport(processHandle, modData.moduleHandle, modData.original_size));
+			pReport.appendReport(new SkippedModuleReport(processHandle, modData.moduleHandle, modData.original_size, modData.szModName));
 			continue;
 		}
 		//load data about the remote module
 		RemoteModuleData remoteModData(processHandle, hMods[counter]);
 		if (remoteModData.isInitialized() == false) {
 			//make a report that initializing remote module was not possible
-			pReport.appendReport(new MalformedHeaderReport(processHandle, hMods[counter], 0));
+			pReport.appendReport(new MalformedHeaderReport(processHandle, hMods[counter], 0, modData.szModName));
 			continue;
 		}
-		t_scan_status is_hollowed = scanForHollows(modData, remoteModData, pReport);
+		t_scan_status is_hollowed = scanForHollows(processHandle, modData, remoteModData, pReport);
 		if (is_hollowed == SCAN_ERROR) {
 			continue;
 		}
@@ -228,7 +329,50 @@ size_t ProcessScanner::scanModules(ProcessScanReport &pReport)  //throws excepti
 		}
 		// if hooks not disabled and process is not hollowed, check for hooks:
 		if (!args.no_hooks && (is_hollowed == SCAN_NOT_SUSPICIOUS)) {
-			scanForHooks(modData, remoteModData, pReport);
+			const bool scan_data = (this->args.data == pesieve::PE_DATA_SCAN_ALWAYS)
+				|| (!this->isDEP && (this->args.data == pesieve::PE_DATA_SCAN_NO_DEP));
+			scanForHooks(processHandle, modData, remoteModData, pReport, scan_data);
+		}
+	}
+	return counter;
+}
+
+size_t pesieve::ProcessScanner::scanModulesIATs(ProcessScanReport &pReport) //throws exceptions
+{
+	if (!pReport.exportsMap) {
+		return 0; // this feature cannot work without Exports Map
+	}
+	HMODULE hMods[1024];
+	const size_t modules_count = enum_modules(this->processHandle, hMods, sizeof(hMods), args.modules_filter);
+	if (modules_count == 0) {
+		return 0;
+	}
+
+	size_t counter = 0;
+	for (counter = 0; counter < modules_count; counter++) {
+		if (processHandle == nullptr) break;
+
+		//load module from file:
+		ModuleData modData(processHandle, hMods[counter]);
+
+		// Don't scan modules that are in the ignore list
+		std::string plainName = peconv::get_file_name(modData.szModName);
+		if (is_in_list(plainName.c_str(), this->ignoredModules)) {
+			continue;
+		}
+
+		//load data about the remote module
+		RemoteModuleData remoteModData(processHandle, hMods[counter]);
+		if (remoteModData.isInitialized() == false) {
+			//make a report that initializing remote module was not possible
+			pReport.appendReport(new MalformedHeaderReport(processHandle, hMods[counter], 0, modData.szModName));
+			continue;
+		}
+
+		bool filterSysHooks = (this->args.iat == pesieve::PE_IATS_FILTERED) ? true : false;
+		t_scan_status is_iat_patched = scanForIATHooks(processHandle, modData, remoteModData, pReport, filterSysHooks);
+		if (is_iat_patched == SCAN_ERROR) {
+			continue;
 		}
 	}
 	return counter;

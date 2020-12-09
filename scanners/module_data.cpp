@@ -1,15 +1,20 @@
 #include "module_data.h"
 
-#include "../utils/util.h"
+#include "../utils/format_util.h"
 #include "../utils/path_converter.h"
+#include "../utils/process_util.h"
+#include "../utils/artefacts_util.h"
+#include "artefact_scanner.h"
 
-#include <Psapi.h>
+#include <psapi.h>
 #pragma comment(lib,"psapi.lib")
 
+using namespace pesieve::util;
+
 //---
-bool ModuleData::loadModuleName()
+bool pesieve::ModuleData::loadModuleName()
 {
-	std::string my_name = RemoteModuleData::getModuleName(processHandle, this->moduleHandle);
+	std::string my_name = pesieve::RemoteModuleData::getModuleName(processHandle, this->moduleHandle);
 	if (my_name.length() == 0 || my_name.length() > MAX_PATH) {
 		//invalid length
 		return false;
@@ -18,16 +23,34 @@ bool ModuleData::loadModuleName()
 	return true;
 }
 
-bool ModuleData::loadOriginal()
+bool pesieve::ModuleData::loadOriginal()
+{
+	//disable FS redirection by default
+	if (_loadOriginal(true)) {
+		return true;
+	}
+	//if loading with FS redirection has failed, try without
+	return _loadOriginal(false);
+}
+
+bool pesieve::ModuleData::_loadOriginal(bool disableFSredir)
 {
 	if (strlen(this->szModName) == 0) {
 		loadModuleName();
 	}
-	is_relocated = false;
 	//just in case if something was loaded before...
 	peconv::free_pe_buffer(original_module, original_size);
 
+	BOOL isRedirDisabled = FALSE;
+	PVOID old_val;
+	if (disableFSredir) {
+		isRedirDisabled = wow64_disable_fs_redirection(&old_val);
+		// try to load with FS redirection disabled
+	}
 	original_module = peconv::load_pe_module(szModName, original_size, false, false);
+	if (isRedirDisabled) {
+		wow64_revert_fs_redirection(old_val);
+	}
 	if (!original_module) {
 		return false;
 	}
@@ -35,13 +58,14 @@ bool ModuleData::loadOriginal()
 	return true;
 }
 
-bool ModuleData::relocateToBase()
+bool pesieve::ModuleData::relocateToBase(ULONGLONG new_base)
 {
 	if (!original_module) return false;
-	if (is_relocated) return true;
 
 	ULONGLONG original_base = peconv::get_image_base(original_module);
-	ULONGLONG new_base = (ULONGLONG) moduleHandle;
+	if (original_base == new_base) {
+		return true; // already relocated
+	}
 	if (peconv::has_relocations(original_module) 
 		&& !peconv::relocate_module(original_module, original_size, new_base, original_base))
 	{
@@ -50,23 +74,24 @@ bool ModuleData::relocateToBase()
 #endif
 		return false;
 	}
+	peconv::update_image_base(original_module, new_base);
 	return true;
 }
 
-bool ModuleData::switchToWow64Path()
+bool pesieve::ModuleData::switchToWow64Path()
 {
 	BOOL isWow64 = FALSE;
-	if (!IsWow64Process(this->processHandle, &isWow64)) {
+	if (!is_process_wow64(this->processHandle, &isWow64)) {
 		//failed to retrieve the info...
 		return false;
 	}
 	if (isWow64) {
-		if (convert_to_wow64_path(szModName)) return true;
+		if (pesieve::util::convert_to_wow64_path(szModName)) return true;
 	}
 	return false;
 }
 
-bool ModuleData::reloadWow64()
+bool pesieve::ModuleData::reloadWow64()
 {
 	if (!switchToWow64Path()) return false;
 
@@ -79,7 +104,7 @@ bool ModuleData::reloadWow64()
 	return true;
 }
 
-bool ModuleData::isDotNetManagedCode()
+bool pesieve::ModuleData::isDotNetManagedCode()
 {
 	//has a directory entry for .NET header
 	IMAGE_DATA_DIRECTORY* dotNetDir = peconv::get_directory_entry(this->original_module, IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR);
@@ -99,54 +124,80 @@ bool ModuleData::isDotNetManagedCode()
 
 //----
 
-std::string RemoteModuleData::getModuleName(HANDLE processHandle, HMODULE modBaseAddr)
+std::string pesieve::RemoteModuleData::getModuleName(HANDLE processHandle, HMODULE modBaseAddr)
 {
 	char filename[MAX_PATH] = { 0 };
 	if (!GetModuleFileNameExA(processHandle, modBaseAddr, filename, MAX_PATH)) {
 		return "";
 	}
-	std::string basic_filename = convert_to_win32_path(filename);
-	std::string expanded = expand_path(basic_filename);
+	std::string basic_filename = pesieve::util::convert_to_win32_path(filename);
+	std::string expanded = pesieve::util::expand_path(basic_filename);
 	if (expanded.length() == 0) {
 		return filename;
 	}
 	return expanded;
 }
 
-std::string RemoteModuleData::getMappedName(HANDLE processHandle, LPVOID modBaseAddr)
+std::string pesieve::RemoteModuleData::getMappedName(HANDLE processHandle, LPVOID modBaseAddr)
 {
 	char filename[MAX_PATH] = { 0 };
 	if (!GetMappedFileNameA(processHandle, modBaseAddr, filename, MAX_PATH) != 0) {
 		return "";
 	}
-	std::string basic_filename = device_path_to_win32_path(filename);
-	std::string expanded = expand_path(basic_filename);
+	std::string expanded = pesieve::util::expand_path(filename);
 	if (expanded.length() == 0) {
 		return filename;
 	}
 	return expanded;
 }
 
-bool RemoteModuleData::init()
+bool pesieve::RemoteModuleData::init()
 {
-	this->is_ready = false;
+	this->isHdrReady = false;
 	if (!loadHeader()) {
 		return false;
 	}
-	this->is_ready = true;
+	this->isHdrReady = true;
 	return true;
 }
 
-bool RemoteModuleData::loadHeader()
+bool pesieve::RemoteModuleData::_loadFullImage(size_t mod_size)
 {
-	SIZE_T read_size = 0;
+	if (this->isFullImageLoaded()) {
+		return true;
+	}
+	this->imgBuffer = peconv::alloc_pe_buffer(mod_size, PAGE_READWRITE);
+	this->imgBufferSize = peconv::read_remote_pe(this->processHandle, (PBYTE)this->modBaseAddr, mod_size, this->imgBuffer, mod_size);
+	if (this->imgBufferSize == mod_size) {
+		return true;
+	}
+	this->freeFullImage();
+	return false;
+}
+
+bool pesieve::RemoteModuleData::loadFullImage()
+{
+	if (this->isFullImageLoaded()) {
+		return true;
+	}
+	size_t mod_size = this->getHdrImageSize();
+	if (_loadFullImage(mod_size)) {
+		return true;
+	}
+	//try again with calculated size:
+	mod_size = calcImgSize();
+	return _loadFullImage(mod_size);
+}
+
+bool pesieve::RemoteModuleData::loadHeader()
+{
 	if (!peconv::read_remote_pe_header(this->processHandle, (PBYTE)this->modBaseAddr, this->headerBuffer, peconv::MAX_HEADER_SIZE)) {
 		return false;
 	}
 	return true;
 }
 
-ULONGLONG RemoteModuleData::getRemoteSectionVa(const size_t section_num)
+ULONGLONG pesieve::RemoteModuleData::getRemoteSectionVa(const size_t section_num)
 {
 	if (!this->isInitialized()) return NULL;
 
@@ -157,7 +208,28 @@ ULONGLONG RemoteModuleData::getRemoteSectionVa(const size_t section_num)
 	return (ULONGLONG) modBaseAddr + section_hdr->VirtualAddress;
 }
 
-bool RemoteModuleData::isSectionExecutable(size_t section_number)
+bool pesieve::RemoteModuleData::isSectionEntry(const size_t section_number)
+{
+	if (!this->isInitialized()) {
+		return false;
+	}
+	const DWORD ep_va = peconv::get_entry_point_rva(this->headerBuffer);
+	if (ep_va == 0) {
+		return false;
+	}
+	PIMAGE_SECTION_HEADER sec_hdr = peconv::get_section_hdr(this->headerBuffer, peconv::MAX_HEADER_SIZE, section_number);
+	if (!sec_hdr) {
+		return false;
+	}
+	if (ep_va >= sec_hdr->VirtualAddress 
+		&& ep_va < (sec_hdr->VirtualAddress + sec_hdr->Misc.VirtualSize))
+	{
+		return true;
+	}
+	return false;
+}
+
+bool pesieve::RemoteModuleData::isSectionExecutable(const size_t section_number, bool allow_data)
 {
 	//for special cases when the section is not set executable in headers, but in reality is executable...
 	//get the section header from the module:
@@ -177,34 +249,35 @@ bool RemoteModuleData::isSectionExecutable(size_t section_number)
 #ifdef _DEBUG
 	std::cout << std::hex << "Sec: " << section_number << " VA: " << start_va << " t: " << page_info.Type << " p: " << page_info.Protect << std::endl;
 #endif
-	DWORD protection = page_info.Protect;
-	DWORD initial_protect = page_info.AllocationProtect;
 
-	bool is_any_exec = false;
-	if (page_info.Type == MEM_IMAGE) {
-		is_any_exec = (protection & SECTION_MAP_EXECUTE)
-			|| (protection & SECTION_MAP_EXECUTE_EXPLICIT);
+	if (pesieve::util::is_executable(page_info.Type, page_info.Protect)) {
+		//std::cout << std::hex << "p1 Sec: " << section_number << " VA: " << start_va << " t: " << page_info.Type << " p: " << page_info.Protect << std::endl;
+		return true;
 	}
-	else {
-		is_any_exec = (initial_protect & PAGE_EXECUTE_READWRITE)
-			|| (initial_protect & PAGE_EXECUTE_READ)
-			|| (initial_protect & PAGE_EXECUTE)
-			|| (initial_protect & PAGE_EXECUTE_WRITECOPY)
-			|| (protection & PAGE_EXECUTE_READWRITE)
-			|| (protection & PAGE_EXECUTE_READ)
-			|| (protection & PAGE_EXECUTE)
-			|| (protection & PAGE_EXECUTE_WRITECOPY);
-	}
-	return is_any_exec;
-}
-
-bool RemoteModuleData::hasExecutableSection()
-{
-	size_t sec_count = peconv::get_sections_count(this->headerBuffer, peconv::MAX_HEADER_SIZE);
-	for (size_t i = 0; i < sec_count ; i++) {
-		if (isSectionExecutable(i)) {
+	if (allow_data) {
+		if (pesieve::util::is_readable(page_info.Type, page_info.Protect)) {
+			//std::cout << std::hex << "p1 Sec: " << section_number << " VA: " << start_va << " t: " << page_info.Type << " p: " << page_info.Protect << std::endl;
 			return true;
 		}
 	}
 	return false;
+}
+
+bool pesieve::RemoteModuleData::hasExecutableSection(bool allow_data)
+{
+	size_t sec_count = peconv::get_sections_count(this->headerBuffer, peconv::MAX_HEADER_SIZE);
+	for (size_t i = 0; i < sec_count ; i++) {
+		if (isSectionExecutable(i, allow_data)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//calculate image size basing on the sizes of sections
+size_t pesieve::RemoteModuleData::calcImgSize()
+{
+	if (!isHdrReady) return 0;
+
+	return ArtefactScanner::calcImgSize(this->processHandle, this->modBaseAddr, this->headerBuffer, peconv::MAX_HEADER_SIZE);
 }

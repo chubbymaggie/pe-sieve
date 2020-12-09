@@ -1,51 +1,60 @@
 
 #pragma once
 
-#include <Windows.h>
+#include <windows.h>
 
 #include "module_scanner.h"
-#include "../utils/util.h"
+#include "../utils/path_util.h"
 
-class MappingScanReport : public ModuleScanReport
-{
-public:
-	MappingScanReport(HANDLE processHandle, HMODULE _module, size_t _moduleSize)
-		: ModuleScanReport(processHandle, _module, _moduleSize)
+namespace pesieve {
+
+	class MappingScanReport : public ModuleScanReport
 	{
-	}
+	public:
+		MappingScanReport(HANDLE processHandle, HMODULE _module, size_t _moduleSize)
+			: ModuleScanReport(processHandle, _module, _moduleSize)
+		{
+		}
 
-	const virtual void fieldsToJSON(std::stringstream &outs, size_t level = JSON_LEVEL)
-	{
-		ModuleScanReport::toJSON(outs, level);
-		outs << ",\n";
-		OUT_PADDED(outs, level, "\"mapped_file\" : \"" << escape_path_separators(this->mappedFile) << "\"");
-		outs << ",\n";
-		OUT_PADDED(outs, level, "\"module_file\" : \"" << escape_path_separators(this->moduleFile) << "\"");
-	}
+		const virtual void fieldsToJSON(std::stringstream &outs, size_t level = JSON_LEVEL)
+		{
+			OUT_PADDED(outs, level, "\"module\" : ");
+			outs << "\"" << std::hex << (ULONGLONG)module << "\"" << ",\n";
 
-	const virtual bool toJSON(std::stringstream& outs, size_t level = JSON_LEVEL)
-	{
-		OUT_PADDED(outs, level, "\"mapping_scan\" : ");
-		outs << "{\n";
-		fieldsToJSON(outs, level + 1);
-		outs << "\n";
-		OUT_PADDED(outs, level, "}");
-		return true;
-	}
-	std::string mappedFile;
-	std::string moduleFile;
-};
+			OUT_PADDED(outs, level, "\"module_file\" : \"" << pesieve::util::escape_path_separators(this->moduleFile) << "\"");
+			outs << ",\n";
+			OUT_PADDED(outs, level, "\"mapped_file\" : \"" << pesieve::util::escape_path_separators(this->mappedFile) << "\"");
 
-//is the mapped file name different than the module file name?
-class MappingScanner {
-public:
-	MappingScanner(HANDLE hProc, ModuleData &moduleData)
-		: processHandle(hProc), moduleData(moduleData)
-	{
-	}
+			outs << ",\n";
+			OUT_PADDED(outs, level, "\"status\" : ");
+			outs << std::dec << status;
+		}
 
-	virtual MappingScanReport* scanRemote();
+		const virtual bool toJSON(std::stringstream& outs, size_t level = JSON_LEVEL)
+		{
+			OUT_PADDED(outs, level, "\"mapping_scan\" : ");
+			outs << "{\n";
+			fieldsToJSON(outs, level + 1);
+			outs << "\n";
+			OUT_PADDED(outs, level, "}");
+			return true;
+		}
 
-	HANDLE processHandle;
-	ModuleData &moduleData;
-};
+		std::string mappedFile;
+	};
+
+	//is the mapped file name different than the module file name?
+	class MappingScanner {
+	public:
+		MappingScanner(HANDLE hProc, ModuleData &moduleData)
+			: processHandle(hProc), moduleData(moduleData)
+		{
+		}
+
+		virtual MappingScanReport* scanRemote();
+
+		HANDLE processHandle;
+		ModuleData &moduleData;
+	};
+
+}; //namespace pesieve

@@ -1,7 +1,9 @@
 #include "mempage_data.h"
 #include "module_data.h"
 
-bool MemPageData::fillInfo()
+using namespace pesieve;
+
+bool pesieve::MemPageData::fillInfo()
 {
 	MEMORY_BASIC_INFORMATION page_info = { 0 };
 	SIZE_T out = VirtualQueryEx(this->processHandle, (LPCVOID) start_va, &page_info, sizeof(page_info));
@@ -24,7 +26,21 @@ bool MemPageData::fillInfo()
 	return true;
 }
 
-bool MemPageData::hasMappedName()
+bool pesieve::MemPageData::loadModuleName()
+{
+	const HMODULE mod_base = (HMODULE)this->alloc_base;
+	std::string module_name = RemoteModuleData::getModuleName(processHandle, mod_base);
+	if (module_name.length() == 0) {
+#ifdef _DEBUG
+		std::cerr << "Could not retrieve module name" << std::endl;
+#endif
+		return false;
+	}
+	this->module_name = module_name;
+	return true;
+}
+
+bool pesieve::MemPageData::loadMappedName()
 {
 	if (!isInfoFilled() && !fillInfo()) {
 		return false;
@@ -36,10 +52,11 @@ bool MemPageData::hasMappedName()
 #endif
 		return false;
 	}
+	this->mapped_name = mapped_filename;
 	return true;
 }
 
-bool MemPageData::isRealMapping()
+bool pesieve::MemPageData::isRealMapping()
 {
 	if (this->loadedData == nullptr && !fillInfo()) {
 #ifdef _DEBUG
@@ -47,17 +64,13 @@ bool MemPageData::isRealMapping()
 #endif
 		return false;
 	}
-	std::string mapped_filename = RemoteModuleData::getMappedName(this->processHandle, (LPVOID) this->alloc_base);
-	if (mapped_filename.length() == 0) {
+	if (!loadMappedName()) {
 #ifdef _DEBUG
 		std::cerr << "Could not retrieve name" << std::endl;
 #endif
 		return false;
 	}
-#ifdef _DEBUG
-	std::cout << mapped_filename << std::endl;
-#endif
-	HANDLE file = CreateFileA(mapped_filename.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+	HANDLE file = CreateFileA(this->mapped_name.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
 	if(file == INVALID_HANDLE_VALUE) {
 #ifdef _DEBUG
 		std::cerr << "Could not open file!" << std::endl;
@@ -94,10 +107,14 @@ bool MemPageData::isRealMapping()
 	return is_same;
 }
 
-bool MemPageData::_loadRemote()
+bool pesieve::MemPageData::_loadRemote()
 {
-	peconv::free_pe_buffer(this->loadedData, this->loadedSize);
+	_freeRemote();
 	size_t region_size = size_t(this->region_end - this->start_va);
+	if (stop_va && ( stop_va >= start_va  && stop_va < this->region_end)) {
+		region_size = size_t(this->stop_va - this->start_va);
+	}
+	
 	if (region_size == 0) {
 		return false;
 	}
@@ -105,10 +122,9 @@ bool MemPageData::_loadRemote()
 	if (loadedData == nullptr) {
 		return false;
 	}
-
+	this->loadedSize = region_size;
 	bool is_guarded = (protection & PAGE_GUARD) != 0;
 
-	this->loadedSize = region_size;
 	size_t size_read = peconv::read_remote_memory(this->processHandle, (BYTE*)this->start_va, loadedData, loadedSize);
 	if ((size_read == 0) && is_guarded) {
 #ifdef _DEBUG
